@@ -8,8 +8,10 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import db, store
+from .analysis import analyze_merge
 from .models import (
     DraftUpdateRequest,
+    MergeAnalysisRequest,
     MergeCreate,
     ResolutionUndoRequest,
     ResolveRequest,
@@ -183,6 +185,22 @@ async def result_validation_failed_handler(request: Request, exc: ResultValidati
             "errors": exc.errors,
         },
     )
+
+
+@app.post("/merge-analysis")
+def merge_analysis(body: MergeAnalysisRequest):
+    """Pre-merge impact analysis without creating a merge order.
+
+    Accepts the same base/left/right triple as ``POST /merges`` but
+    persists nothing. The response lists one change record per minimal
+    affected JSON Pointer — ``left_only`` / ``right_only`` /
+    ``same_change`` / ``conflict`` — sorted by pointer, with absent keys
+    kept distinct from explicit nulls. Parent deletions or type
+    replacements collapse to a single record at the parent path (the
+    subtree is not enumerated). Per-category counts and ``would_conflict``
+    are included; repeated identical requests return identical responses.
+    """
+    return analyze_merge(body.base, body.left, body.right)
 
 
 @app.get("/health")

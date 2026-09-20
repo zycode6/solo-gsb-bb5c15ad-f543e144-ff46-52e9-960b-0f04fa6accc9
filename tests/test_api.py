@@ -695,3 +695,188 @@ def test_rule_application_failure_leaves_no_partial_change(client):
     fetched = client.get(f"/merges/{mid}").json()
     assert fetched["revision"] == 1
     assert fetched["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Pre-merge impact analysis: POST /merge-analysis (stateless, no persistence)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_analysis_classifies_and_counts(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"replicas": 1, "db": {"host": "a", "port": 5432}},
+            "left": {"replicas": 3, "db": {"host": "b", "port": 5432}},
+            "right": {"replicas": 1, "db": {"host": "c", "port": 5433}},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    categories = {r["pointer"]: r["category"] for r in body["records"]}
+    assert categories == {
+        "/db/host": "conflict",
+        "/db/port": "right_only",
+        "/replicas": "left_only",
+    }
+    # Records are sorted stably by JSON Pointer.
+    pointers = [r["pointer"] for r in body["records"]]
+    assert pointers == sorted(pointers)
+    assert body["counts"] == {
+        "left_only": 1,
+        "right_only": 1,
+        "same_change": 0,
+        "conflict": 1,
+    }
+    assert body["total"] == 3
+    assert body["would_conflict"] is True
+    assert body["conflict_count"] == 1
+
+
+def test_merge_analysis_clean_merge_reports_no_conflict(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 2, "b": 1},
+            "right": {"a": 2, "b": 3},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["would_conflict"] is False
+    assert body["conflict_count"] == 0
+    assert {r["category"] for r in body["records"]} <= {
+        "left_only",
+        "right_only",
+        "same_change",
+    }
+
+
+def test_merge_analysis_no_changes(client):
+    doc = {"a": {"nested": 1}, "b": [1, 2]}
+    resp = client.post(
+        "/merge-analysis", json={"base": doc, "left": doc, "right": doc}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["records"] == []
+    assert body["total"] == 0
+    assert body["would_conflict"] is False
+
+
+def test_merge_analysis_parent_deletion_collapses_to_minimal_root(client):
+    # Left deletes the whole /db subtree while right edits one leaf inside
+    # it: exactly one conflict record at /db, no per-child double counting.
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"keep": 1, "db": {"host": "a", "port": 5432}},
+            "left": {"keep": 1},
+            "right": {"keep": 1, "db": {"host": "c", "port": 5433}},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["pointer"] for r in body["records"]] == ["/db"]
+    record = body["records"][0]
+    assert record["category"] == "conflict"
+    assert record["missing"] == ["left"]
+
+
+def test_merge_analysis_type_replacement_collapses_to_minimal_root(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"x": {"y": 1, "z": 2}},
+            "left": {"x": {"y": 7, "z": 8}},
+            "right": {"x": "scalar"},
+        },
+    )
+    assert resp.status_code == 200
+    pointers = [r["pointer"] for r in resp.json()["records"]]
+    assert pointers == ["/x"]
+
+
+def test_merge_analysis_missing_vs_explicit_null(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={"base": {"k": 1}, "left": {"k": None}, "right": {}},
+    )
+    assert resp.status_code == 200
+    record = resp.json()["records"][0]
+    assert record["pointer"] == "/k"
+    assert record["category"] == "conflict"
+    # Both render as JSON null, but only the right side is actually missing.
+    assert record["left"] is None
+    assert record["right"] is None
+    assert record["missing"] == ["right"]
+
+
+def test_merge_analysis_same_change_both_deleted(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"a": 1, "keep": 2},
+            "left": {"keep": 2},
+            "right": {"keep": 2},
+        },
+    )
+    assert resp.status_code == 200
+    record = resp.json()["records"][0]
+    assert record["pointer"] == "/a"
+    assert record["category"] == "same_change"
+    assert record["missing"] == ["left", "right"]
+
+
+def test_merge_analysis_repeated_requests_identical_and_persist_nothing(client):
+    payload = {
+        "base": {"z": 1, "a": {"y": 1, "x": [1, {"k": "v"}]}},
+        "left": {"z": 2, "a": {"y": 1, "x": [2, {"k": "w"}]}},
+        "right": {"z": 3, "a": {"y": 9, "x": [1, {"k": "v"}]}},
+    }
+    first = client.post("/merge-analysis", json=payload).json()
+    for _ in range(3):
+        again = client.post("/merge-analysis", json=payload).json()
+        assert again == first
+
+    # The analysis is stateless: a merge created afterwards is an independent
+    # order starting at revision 1, regardless of how many analyses ran first.
+    created = client.post("/merges", json=payload).json()
+    assert created["revision"] == 1
+    assert client.get("/health").status_code == 200
+
+
+def test_merge_analysis_agrees_with_created_merge_conflicts(client):
+    payload = {
+        "base": {"a": 1, "b": {"x": 1}, "c": [1], "d": 1},
+        "left": {"a": 2, "b": {"x": 2}, "c": [2], "d": 1},
+        "right": {"a": 3, "b": {"x": 3}, "c": [1], "d": 9},
+    }
+    analysis = client.post("/merge-analysis", json=payload).json()
+    created = client.post("/merges", json=payload).json()
+    analysis_conflicts = sorted(
+        r["pointer"]
+        for r in analysis["records"]
+        if r["category"] == "conflict"
+    )
+    created_conflicts = sorted(c["pointer"] for c in created["conflicts"])
+    assert analysis_conflicts == created_conflicts
+    assert analysis["conflict_count"] == created["conflict_count"]
+    assert analysis["would_conflict"] == (created["status"] == "pending")
+
+
+def test_merge_analysis_requires_base_left_right(client):
+    resp = client.post("/merge-analysis", json={"base": {}, "left": {}})
+    assert resp.status_code == 422
+
+
+def test_merge_analysis_accepts_root_documents(client):
+    resp = client.post(
+        "/merge-analysis", json={"base": 1, "left": 2, "right": 3}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["records"][0]["pointer"] == ""
+    assert body["records"][0]["category"] == "conflict"
+    assert body["would_conflict"] is True
