@@ -8,8 +8,10 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import db, store
+from .analysis import analyze_merge
 from .models import (
     DraftUpdateRequest,
+    MergeAnalysisRequest,
     MergeCreate,
     ResolutionUndoRequest,
     ResolveRequest,
@@ -208,6 +210,21 @@ def create_merge(
     if not created:
         response.status_code = 200
     return view
+
+
+@app.post("/merge-analysis")
+def merge_analysis(body: MergeAnalysisRequest):
+    """Pre-merge impact analysis for a base/left/right triple.
+
+    Accepts the same documents as ``POST /merges`` but never persists
+    anything: it returns change records by JSON Pointer (sorted) classified
+    into left_only / right_only / same_change / conflict, with per-category
+    counts and ``would_conflict``. Missing keys and explicit nulls stay
+    distinguishable; a deleted subtree or a type replacement is reported
+    once at its minimal root path. Repeated identical requests return
+    identical responses.
+    """
+    return analyze_merge(body.base, body.left, body.right)
 
 
 @app.get("/merges/{merge_id}")

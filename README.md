@@ -40,6 +40,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| `POST` | `/merge-analysis` | 合并前影响分析：只试算不落库，按 JSON Pointer 返回四类 change records、分类计数与 `would_conflict` |
 | `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键、可选 `result_schema` 门禁） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值（最后一批须通过 schema 门禁） |
@@ -554,13 +555,79 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/audit
 - 合并单不存在 → **`404`**。
 - 既有接口的响应体不因审计模块增加任何字段，完全保持兼容。
 
+### 11. 合并前影响分析 — `POST /merge-analysis`
+
+创建合并单之前，可用与 `POST /merges` **完全相同的 `base` / `left` / `right`** 先做一次纯试算：服务按 JSON Pointer 联合遍历三份文档，返回每个**最小变更路径**的 change record 及其分类，并给出分类计数与 `would_conflict`。接口**不落任何库**（不创建合并单、不写审计、无 revision），天然幂等：**相同请求重复发送，响应逐字节一致**。
+
+```bash
+curl -s -X POST http://localhost:8000/merge-analysis \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"replicas": 1, "image": "app:v1", "db": {"host": "a", "port": 5432}},
+    "left":  {"replicas": 3, "image": "app:v1", "db": {"host": "b", "port": 5432}},
+    "right": {"replicas": 1, "image": "app:v2", "db": {"host": "c", "port": 5433}}
+  }'
+```
+
+```json
+{
+  "changes": [
+    {"pointer": "/db/host", "type": "conflict",
+     "base": "a", "left": "b", "right": "c", "missing": []},
+    {"pointer": "/db/port", "type": "right_only",
+     "base": 5432, "left": 5432, "right": 5433, "missing": []},
+    {"pointer": "/image", "type": "right_only",
+     "base": "app:v1", "left": "app:v1", "right": "app:v2", "missing": []},
+    {"pointer": "/replicas", "type": "left_only",
+     "base": 1, "left": 3, "right": 1, "missing": []}
+  ],
+  "counts": {"left_only": 1, "right_only": 2, "same_change": 0, "conflict": 1, "total": 4},
+  "would_conflict": true
+}
+```
+
+**记录分类（`type`）**：
+
+| type | 含义 |
+| --- | --- |
+| `left_only` | 仅 left 相对 base 发生变化（将自动采用 left） |
+| `right_only` | 仅 right 相对 base 发生变化（将自动采用 right） |
+| `same_change` | 两侧做了**相同**修改（将自动合并为该值） |
+| `conflict` | 两侧做了**不同**修改（与合并引擎判定完全一致） |
+
+每条记录包含：
+
+- `pointer`：RFC 6901 JSON Pointer（根文档为 `""`；`~` → `~0`、`/` → `~1`）；
+- `base` / `left` / `right`：该路径上的三方取值（缺失侧序列化为 `null`）；
+- `missing`：哪些侧在该路径**键不存在**（取值同冲突记录，`"base"` / `"left"` / `"right"` 的子集）；
+- `type`：上述分类之一。
+
+**最小根路径（避免子树重复计数）**：
+
+- 整个子树被一侧**新增**或**删除**、或发生**类型替换**（对象 ↔ 标量/数组）时，只在该子树的根路径输出**一条**记录，遍历不会进入子树，子树下的叶子不再单独计数；
+- 一侧删除父节点、另一侧修改其子树时，只在父路径报告**一条 `conflict`**（与 `POST /merges` 实际产生的冲突位置一致）；
+- 两侧对**已存在的对象**做不同修改时才按键递归到叶子；两侧以不同内容新增同一对象键时，同样按键递归（不重合的键各自成为 `left_only` / `right_only`）。
+
+**缺失与显式 `null` 严格区分**：
+
+- 一侧把键显式设为 `null`、另一侧删除该键 → 该路径为 `conflict`，记录中显式 `null` 照常作为取值，只有删除侧出现在 `missing` 中；
+- 两侧都显式设为 `null` → `same_change` 且 `missing` 为空；
+- 一侧新增显式 `null`、另一侧未新增 → `left_only` / `right_only`，`missing` 同时包含 base 与未变更侧。
+
+其余约定：
+
+- `changes` 按 `pointer` 字典序**稳定排序**；无任何变化时为 `[]`，各计数均为 `0`。
+- `counts` 给出四类各自数量与 `total`；`would_conflict` 为 `true` 当且仅当该三元组在 `POST /merges` 中会创建**待处理（pending）**合并单，因此可用于提交前预判是否需要人工裁决。
+- 缺少 `base` / `left` / `right` 任一字段 → **`422`**；字段类型可为任意合法 JSON（标量、数组、对象、`null`）。
+- 该接口不接受也不需要 `revision`、`idempotency_key` 或 `result_schema`；它不产生任何副作用，可安全反复调用。
+
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（167 项）
+python -m pytest tests/ -q                  # 运行测试（188 项）
 ```
 
 ## 项目结构
@@ -568,6 +635,7 @@ python -m pytest tests/ -q                  # 运行测试（167 项）
 ```
 app/
   main.py       # FastAPI 路由与错误映射（404/409/400/422）
+  analysis.py   # 合并前影响分析：纯内存三方联合遍历，四类 change records + would_conflict（不落库）
   merge.py      # 纯 Python 三方合并引擎（JSON Pointer 递归）
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   reuse.py      # 历史裁决复用：指针 + base/left/right/missing 规范化匹配、来源结果取值/删除

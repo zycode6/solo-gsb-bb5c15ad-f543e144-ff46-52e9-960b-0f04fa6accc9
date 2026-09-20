@@ -25,6 +25,12 @@ class MergeCreate(BaseModel):
     )
 
 
+class MergeAnalysisRequest(BaseModel):
+    base: Any = Field(..., description="Common ancestor JSON document")
+    left: Any = Field(..., description="Left side JSON document")
+    right: Any = Field(..., description="Right side JSON document")
+
+
 class ResolutionItem(BaseModel):
     pointer: str = Field(..., description="JSON Pointer of an open conflict")
     choice: Literal["left", "right"] | None = Field(

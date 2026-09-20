@@ -695,3 +695,116 @@ def test_rule_application_failure_leaves_no_partial_change(client):
     fetched = client.get(f"/merges/{mid}").json()
     assert fetched["revision"] == 1
     assert fetched["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# POST /merge-analysis: stateless pre-merge impact analysis
+# --------------------------------------------------------------------------------------
+
+
+def test_merge_analysis_classification_and_counts(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"replicas": 1, "image": "v1", "db": {"host": "a", "port": 5432}},
+            "left": {"replicas": 3, "image": "v1", "db": {"host": "b", "port": 5432}},
+            "right": {"replicas": 1, "image": "v2", "db": {"host": "c", "port": 5433}},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["would_conflict"] is True
+    assert body["counts"] == {
+        "left_only": 1,
+        "right_only": 2,
+        "same_change": 0,
+        "conflict": 1,
+        "total": 4,
+    }
+    pointers = [c["pointer"] for c in body["changes"]]
+    assert pointers == sorted(pointers)
+    by_pointer = {c["pointer"]: c for c in body["changes"]}
+    assert by_pointer["/db/host"]["type"] == "conflict"
+    assert by_pointer["/db/host"]["left"] == "b"
+    assert by_pointer["/db/host"]["right"] == "c"
+    assert by_pointer["/db/host"]["missing"] == []
+    assert by_pointer["/replicas"]["type"] == "left_only"
+    assert by_pointer["/image"]["type"] == "right_only"
+    assert by_pointer["/db/port"]["type"] == "right_only"
+
+
+def test_merge_analysis_minimal_root_for_deleted_subtree(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"a": {"x": 1, "y": 2}},
+            "left": {},
+            "right": {"a": {"x": 1, "y": 2}},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [c["pointer"] for c in body["changes"]] == ["/a"]
+    assert body["changes"][0]["type"] == "left_only"
+    assert body["changes"][0]["missing"] == ["left"]
+    assert body["would_conflict"] is False
+
+
+def test_merge_analysis_missing_vs_explicit_null(client):
+    # Left explicitly nulls the key; right deletes it -> conflict, and the
+    # record keeps null as a value while only right appears in missing.
+    resp = client.post(
+        "/merge-analysis",
+        json={"base": {"a": 1}, "left": {"a": None}, "right": {}},
+    )
+    body = resp.json()
+    assert len(body["changes"]) == 1
+    record = body["changes"][0]
+    assert record["pointer"] == "/a"
+    assert record["type"] == "conflict"
+    assert record["left"] is None
+    assert record["missing"] == ["right"]
+
+
+def test_merge_analysis_is_repeatable_and_persists_nothing(client):
+    payload = {
+        "base": {"replicas": 1, "db": {"host": "a", "port": 5432}},
+        "left": {"replicas": 3, "db": {"host": "b", "port": 5432}},
+        "right": {"replicas": 1, "db": {"host": "c", "port": 5433}},
+    }
+    first = client.post("/merge-analysis", json=payload)
+    second = client.post("/merge-analysis", json=payload)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+
+    # The analysis response carries no merge_id and analysis calls persist
+    # nothing. (Earlier tests in the module-scoped database may already have
+    # created merge orders, but repeated analyses must not add any.)
+    assert "merge_id" not in first.json()
+    from app import db
+
+    count_before = db.query_one("SELECT COUNT(*) AS n FROM merges")["n"]
+    client.post("/merge-analysis", json=payload)
+    client.post("/merge-analysis", json=payload)
+    count_after = db.query_one("SELECT COUNT(*) AS n FROM merges")["n"]
+    assert count_after == count_before
+
+
+def test_merge_analysis_no_conflicts_would_conflict_false(client):
+    resp = client.post(
+        "/merge-analysis",
+        json={
+            "base": {"a": 1, "b": 2},
+            "left": {"a": 1, "b": 20},
+            "right": {"a": 10, "b": 2},
+        },
+    )
+    body = resp.json()
+    assert body["would_conflict"] is False
+    assert body["counts"]["conflict"] == 0
+    assert body["counts"]["total"] == 2
+
+
+def test_merge_analysis_requires_base_left_right(client):
+    resp = client.post("/merge-analysis", json={"base": {}, "left": {}})
+    assert resp.status_code == 422
